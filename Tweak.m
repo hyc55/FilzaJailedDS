@@ -492,6 +492,10 @@ static dispatch_queue_t g_chown_queue = NULL;
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
 // or nil if the path isn't inside one.
 static NSString *app_root_for_path(NSString *path) {
+    if ([[path lowercaseString] hasPrefix:@"/var/mobile/library"]) {
+        return path; // Return the path itself so we incrementally chown just what the user lists
+    }
+
     if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
     NSArray<NSString *> *comps = [path pathComponents];
     for (NSUInteger i = 0; i < comps.count; i++) {
@@ -607,29 +611,6 @@ static void installHooks(void) {
     NSLog(@"[Tweak] All hooks installed");
 }
 
-#include <sys/stat.h>
-#include <unistd.h>
-#include <stdio.h>
-
-// 将修复函数放在这里
-void restore_carrier_bundles_dir(void) {
-    const char *path = "/var/mobile/Library/Carrier Bundles";
-    
-    // 1. 删除损坏的空文件
-    if (unlink(path) == 0) {
-        NSLog(@"[Tweak] Removed corrupted 0KB file");
-    }
-
-    // 2. 重新创建为文件夹 (0755权限)
-    if (mkdir(path, 0755) == 0) {
-        NSLog(@"[Tweak] Successfully recreated directory.");
-        // 3. 修改所有者为 mobile (501:501)
-        if (chown(path, 501, 501) == 0) {
-            NSLog(@"[Tweak] Successfully chowned to mobile:mobile.");
-        }
-    }
-}
-
 #pragma mark - Exploit (silent, background)
 
 static void runExploit(void) {
@@ -645,13 +626,13 @@ static void runExploit(void) {
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
-    // ==========================================
-    // 在沙盒逃逸成功后，立刻调用修复函数！
-    // ==========================================
-    if (sret == 0) { // 如果沙盒逃逸成功 (假设0为成功)
-        restore_carrier_bundles_dir();
-    }
-    // ==========================================
+    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
+    // flip on-disk ownership to mobile before opening. Example:
+    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
+
+    // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
+    // first time Filza lists anything inside /var/containers/Bundle/Application/
+    // <UUID>/<Name>.app, apfs_own_tree fires on that .app in the background.
 }
 
 #pragma mark - Entry Point
