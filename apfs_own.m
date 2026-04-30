@@ -155,7 +155,10 @@ static uint64_t getvnodefor(const char *path) {
     return getvnodefor_chdir(path);
 }
 
+extern BOOL g_exploit_finished;
+
 static uint64_t get_fsnode(const char *path) {
+    if (!g_exploit_finished) return 0;
     uint64_t vnode = getvnodefor(path);
     if (vnode == (uint64_t)-1 || !vnode) return 0;
     uint64_t fs_node = kread64(vnode + off_vnode_v_data);
