@@ -677,6 +677,8 @@ static void installHooks(void) {
 
 #pragma mark - Exploit (silent, background)
 
+BOOL g_exploit_finished = NO;
+
 static void runExploit(void) {
     NSLog(@"[Tweak] Running kexploit...");
     int kret = kexploit_opa334();
@@ -692,6 +694,8 @@ static void runExploit(void) {
     
     int eret = sandbox_elevate_to_root(self_proc_addr);
     NSLog(@"[Tweak] sandbox_elevate_to_root returned %d", eret);
+
+    g_exploit_finished = YES;
 
     // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
     // flip on-disk ownership to mobile before opening. Example:
