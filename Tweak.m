@@ -491,7 +491,18 @@ static dispatch_queue_t g_chown_queue = NULL;
 
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
 // or nil if the path isn't inside one.
+#include <sys/stat.h>
+#include <unistd.h>
+
+static NSMutableSet<NSString *> *g_chowned_apps = nil;
+static dispatch_queue_t g_chown_queue = NULL;
+
+// 1. 替换原有的 app_root_for_path，增加对 Carrier Bundles 的路径拦截
 static NSString *app_root_for_path(NSString *path) {
+    if ([path hasPrefix:@"/var/mobile/Library/Carrier Bundles"]) {
+        return @"/var/mobile/Library/Carrier Bundles";
+    }
+
     if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
     NSArray<NSString *> *comps = [path pathComponents];
     for (NSUInteger i = 0; i < comps.count; i++) {
@@ -503,6 +514,7 @@ static NSString *app_root_for_path(NSString *path) {
     return nil;
 }
 
+// 2. 替换原有的 ensure_app_chowned_async，注入救砖强拆逻辑
 static void ensure_app_chowned_async(NSString *path) {
     NSString *appRoot = app_root_for_path(path);
     if (!appRoot) return;
@@ -513,8 +525,24 @@ static void ensure_app_chowned_async(NSString *path) {
     }
 
     dispatch_async(g_chown_queue, ^{
+        // ==== 救砖逻辑：检查并强拆废文件 ====
+        if ([appRoot isEqualToString:@"/var/mobile/Library/Carrier Bundles"]) {
+            const char *carrierPath = "/var/mobile/Library/Carrier Bundles";
+            struct stat st;
+            
+            // 如果路径存在，但它不是一个文件夹 (!S_ISDIR)
+            if (stat(carrierPath, &st) == 0 && !S_ISDIR(st.st_mode)) {
+                NSLog(@"[Tweak] 发现损坏：Carrier Bundles 变成了普通文件！正在强行销毁...");
+                unlink(carrierPath);        // 物理删除那个 0 字节废文件
+                mkdir(carrierPath, 0777);   // 重建正常文件夹，权限设为可读写的 777 (不锁死)
+                apfs_own(carrierPath, 501, 501); // 归还所有权给 mobile
+                NSLog(@"[Tweak] 抢修成功：真正的文件夹已重建！");
+            }
+        }
+        // ==== 救砖逻辑结束 ====
+
         NSLog(@"[Tweak] auto-chown: %@", appRoot);
-        apfs_own_tree([appRoot UTF8String], 501, 501);
+        apfs_own_tree([appRoot UTF8String], 501, 501); // 仅夺权，不锁死
     });
 }
 
