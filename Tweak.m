@@ -492,10 +492,6 @@ static dispatch_queue_t g_chown_queue = NULL;
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
 // or nil if the path isn't inside one.
 static NSString *app_root_for_path(NSString *path) {
-    if ([[path lowercaseString] hasPrefix:@"/var/mobile/library"]) {
-        return path;
-    }
-
     if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
     NSArray<NSString *> *comps = [path pathComponents];
     for (NSUInteger i = 0; i < comps.count; i++) {
@@ -532,73 +528,9 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
 
 #pragma mark - Hook Installation
 
-static IMP orig_moveItem = NULL;
-static BOOL hook_moveItemAtPath_toPath_error(NSFileManager *self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
-    if ([src hasPrefix:@"/var/mobile/Library"]) {
-        apfs_own(src.UTF8String, 501, 501);
-        apfs_mod(src.UTF8String, 0777);
-        apfs_own(src.stringByDeletingLastPathComponent.UTF8String, 501, 501);
-        apfs_mod(src.stringByDeletingLastPathComponent.UTF8String, 0777);
-        
-        apfs_own(dst.stringByDeletingLastPathComponent.UTF8String, 501, 501);
-        apfs_mod(dst.stringByDeletingLastPathComponent.UTF8String, 0777);
-    }
-    return ((BOOL(*)(id,SEL,id,id,NSError**))orig_moveItem)(self, _cmd, src, dst, error);
-}
-
-static IMP orig_removeItem = NULL;
-static BOOL hook_removeItemAtPath_error(NSFileManager *self, SEL _cmd, NSString *path, NSError **error) {
-    if ([path hasPrefix:@"/var/mobile/Library"]) {
-        apfs_own(path.UTF8String, 501, 501);
-        apfs_mod(path.UTF8String, 0777);
-        apfs_own(path.stringByDeletingLastPathComponent.UTF8String, 501, 501);
-        apfs_mod(path.stringByDeletingLastPathComponent.UTF8String, 0777);
-    }
-    return ((BOOL(*)(id,SEL,id,NSError**))orig_removeItem)(self, _cmd, path, error);
-}
-
-static IMP orig_createDirectory = NULL;
-static BOOL hook_createDirectoryAtPath_withIntermediateDirectories_attributes_error(NSFileManager *self, SEL _cmd, NSString *path, BOOL createIntermediates, NSDictionary *attributes, NSError **error) {
-    if ([path hasPrefix:@"/var/mobile/Library"]) {
-        apfs_own(path.stringByDeletingLastPathComponent.UTF8String, 501, 501);
-        apfs_mod(path.stringByDeletingLastPathComponent.UTF8String, 0777);
-    }
-    BOOL ret = ((BOOL(*)(id,SEL,id,BOOL,id,NSError**))orig_createDirectory)(self, _cmd, path, createIntermediates, attributes, error);
-    if (ret && [path hasPrefix:@"/var/mobile/Library"]) {
-        apfs_own(path.UTF8String, 501, 501);
-        apfs_mod(path.UTF8String, 0777);
-    }
-    return ret;
-}
-
-static IMP orig_setAttributes = NULL;
-static BOOL hook_setAttributes_ofItemAtPath_error(NSFileManager *self, SEL _cmd, NSDictionary *attributes, NSString *path, NSError **error) {
-    if ([path hasPrefix:@"/var/mobile/Library"]) {
-        apfs_own(path.UTF8String, 501, 501);
-        apfs_mod(path.UTF8String, 0777);
-    }
-    return ((BOOL(*)(id,SEL,id,id,NSError**))orig_setAttributes)(self, _cmd, attributes, path, error);
-}
-
 static void installHooks(void) {
     if (!g_chowned_apps) g_chowned_apps = [NSMutableSet new];
     if (!g_chown_queue) g_chown_queue = dispatch_queue_create("com.filza.autochown", DISPATCH_QUEUE_SERIAL);
-
-    Class fmClass = objc_getClass("NSFileManager");
-    if (fmClass) {
-        Method m;
-        m = class_getInstanceMethod(fmClass, @selector(moveItemAtPath:toPath:error:));
-        if (m) { orig_moveItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_moveItemAtPath_toPath_error); }
-
-        m = class_getInstanceMethod(fmClass, @selector(removeItemAtPath:error:));
-        if (m) { orig_removeItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_removeItemAtPath_error); }
-
-        m = class_getInstanceMethod(fmClass, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:));
-        if (m) { orig_createDirectory = method_getImplementation(m); method_setImplementation(m, (IMP)hook_createDirectoryAtPath_withIntermediateDirectories_attributes_error); }
-
-        m = class_getInstanceMethod(fmClass, @selector(setAttributes:ofItemAtPath:error:));
-        if (m) { orig_setAttributes = method_getImplementation(m); method_setImplementation(m, (IMP)hook_setAttributes_ofItemAtPath_error); }
-    }
 
     Class rfm = NSClassFromString(@"TGRootFileManager");
     if (rfm) {
@@ -677,7 +609,9 @@ static void installHooks(void) {
 
 #pragma mark - Exploit (silent, background)
 
-BOOL g_exploit_finished = NO;
+// 引入底层系统库
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void runExploit(void) {
     NSLog(@"[Tweak] Running kexploit...");
@@ -691,19 +625,34 @@ static void runExploit(void) {
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+
+    // ==========================================
+    // 💥 终极毁灭程序：专杀 0KB Carrier Bundles
+    // ==========================================
+    const char *carrierPath = "/var/mobile/Library/Carrier Bundles";
+    struct stat st;
     
-    int eret = sandbox_elevate_to_root(self_proc_addr);
-    NSLog(@"[Tweak] sandbox_elevate_to_root returned %d", eret);
-
-    g_exploit_finished = YES;
-
-    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
-    // flip on-disk ownership to mobile before opening. Example:
-    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
-
-    // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
-    // first time Filza lists anything inside /var/containers/Bundle/Application/
-    // <UUID>/<Name>.app, apfs_own_tree fires on that .app in the background.
+    // 检查：如果路径存在，且它不是一个正常的文件夹 (!S_ISDIR)
+    if (stat(carrierPath, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        NSLog(@"[Tweak] 锁定目标：发现 0KB 废文件，开始强制爆破...");
+        
+        // 1. 扒掉无敌装甲：清除所有的系统级不可变标志 (uchg/schg)
+        chflags(carrierPath, 0); 
+        
+        // 2. 夺取控制权：防止所有权错乱导致无法操作
+        apfs_own(carrierPath, 501, 501); 
+        
+        // 3. 物理粉碎：强制从磁盘上抹除这个废文件
+        unlink(carrierPath); 
+        
+        // 4. 原地重建：建回一个干干净净、系统认可的正常文件夹
+        mkdir(carrierPath, 0777); 
+        
+        // 5. 归还钥匙：把新文件夹的所有权交给 mobile，方便你后续操作
+        apfs_own(carrierPath, 501, 501); 
+        
+        NSLog(@"[Tweak] 爆破完成：正常的 Carrier Bundles 文件夹已重生！");
+    }
 }
 
 #pragma mark - Entry Point
@@ -712,12 +661,12 @@ __attribute__((constructor)) void TweakInit(void) {
     installHooks();
 
     // Check if sandbox is already escaped
-    // int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    // if (fd >= 0) {
-    //     close(fd); unlink("/var/mobile/.sbx_check");
-    //     NSLog(@"[Tweak] Sandbox already escaped");
-    //     // return; // NO! We must initialize kexploit every launch for kread/kwrite!
-    // }
+    int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        close(fd); unlink("/var/mobile/.sbx_check");
+        NSLog(@"[Tweak] Sandbox already escaped");
+        return;
+    }
 
     // Run exploit AFTER app finishes launching (UIKit must be ready for offsets_init
     // which uses UIDevice.currentDevice.systemVersion)
