@@ -485,10 +485,6 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
 // Lazy, per-.app chown: when Filza lists any path inside
 // /var/containers/Bundle/Application/<UUID>/<Name>.app[/...], run
 // apfs_own_tree on that .app (one time) to flip everything to 501:501.
-
-static NSMutableSet<NSString *> *g_chowned_apps = nil;
-static dispatch_queue_t g_chown_queue = NULL;
-
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
 // or nil if the path isn't inside one.
 #include <sys/stat.h>
