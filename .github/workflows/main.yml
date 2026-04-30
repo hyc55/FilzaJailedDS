@@ -1,0 +1,33 @@
+name: Build FilzaJailed Tweak
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: 获取源码
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 配置 Theos, SDK 和签名工具
+        run: |
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          rm -rf $HOME/theos/sdks
+          git clone https://github.com/theos/sdks.git $HOME/theos/sdks
+          brew install ldid
+
+      - name: 开始编译
+        run: |
+          make clean
+          make FINALPACKAGE=1
+
+      - name: 提取并上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilzaApplySandboxExt-Dylib
+          path: .theos/obj/**/*.dylib
