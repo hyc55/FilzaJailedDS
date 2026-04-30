@@ -607,11 +607,30 @@ static void installHooks(void) {
     NSLog(@"[Tweak] All hooks installed");
 }
 
-#pragma mark - Exploit (silent, background)
-
-// 确保文件最顶部有这两个头文件（如果有就不管）
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdio.h>
+
+// 将修复函数放在这里
+void restore_carrier_bundles_dir(void) {
+    const char *path = "/var/mobile/Library/Carrier Bundles";
+    
+    // 1. 删除损坏的空文件
+    if (unlink(path) == 0) {
+        NSLog(@"[Tweak] Removed corrupted 0KB file");
+    }
+
+    // 2. 重新创建为文件夹 (0755权限)
+    if (mkdir(path, 0755) == 0) {
+        NSLog(@"[Tweak] Successfully recreated directory.");
+        // 3. 修改所有者为 mobile (501:501)
+        if (chown(path, 501, 501) == 0) {
+            NSLog(@"[Tweak] Successfully chowned to mobile:mobile.");
+        }
+    }
+}
+
+#pragma mark - Exploit (silent, background)
 
 static void runExploit(void) {
     NSLog(@"[Tweak] Running kexploit...");
@@ -626,19 +645,13 @@ static void runExploit(void) {
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
-    // ==== 暴力救砖逻辑：漏洞提权成功后立刻强拆，无需点击 ====
-    const char *carrierPath = "/var/mobile/Library/Carrier Bundles";
-    struct stat st;
-    
-    // 如果路径存在，且不是文件夹
-    if (stat(carrierPath, &st) == 0 && !S_ISDIR(st.st_mode)) {
-        NSLog(@"[Tweak] 启动静默强拆程序：销毁 0KB 废文件...");
-        unlink(carrierPath);        // 物理删除 0 字节文件
-        mkdir(carrierPath, 0777);   // 重建 777 权限的新文件夹
-        apfs_own(carrierPath, 501, 501); // 强制把新文件夹所有权交还给 mobile
-        NSLog(@"[Tweak] 强拆重建完毕！");
+    // ==========================================
+    // 在沙盒逃逸成功后，立刻调用修复函数！
+    // ==========================================
+    if (sret == 0) { // 如果沙盒逃逸成功 (假设0为成功)
+        restore_carrier_bundles_dir();
     }
-    // ==== 救砖逻辑结束 ====
+    // ==========================================
 }
 
 #pragma mark - Entry Point
