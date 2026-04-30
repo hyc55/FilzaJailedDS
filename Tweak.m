@@ -523,13 +523,6 @@ static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) 
     if ([path isKindOfClass:[NSString class]]) {
         ensure_app_chowned_async((NSString *)path);
     }
-    if ([strPath hasPrefix:@"/var/mobile/Library/Carrier Bundles"]) {
-            dispatch_async(g_chown_queue, ^{
-                NSLog(@"[Tweak] auto-chown: 正在为 Carrier Bundles 提权...");
-                apfs_own_tree("/var/mobile/Library/Carrier Bundles", 501, 501);
-            });
-        }
-    }
     return ((id(*)(id,SEL,id,NSError**))orig_contentsOfDirectory)(self, _cmd, path, error);
 }
 
