@@ -492,10 +492,6 @@ static dispatch_queue_t g_chown_queue = NULL;
 // Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
 // or nil if the path isn't inside one.
 static NSString *app_root_for_path(NSString *path) {
-    if ([[path lowercaseString] hasPrefix:@"/var/mobile/library"]) {
-        return path; // Return the path itself so we incrementally chown just what the user lists
-    }
-
     if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
     NSArray<NSString *> *comps = [path pathComponents];
     for (NSUInteger i = 0; i < comps.count; i++) {
@@ -508,6 +504,15 @@ static NSString *app_root_for_path(NSString *path) {
 }
 
 static void ensure_app_chowned_async(NSString *path) {
+    if ([[path lowercaseString] hasPrefix:@"/var/mobile/library"]) {
+        // Just chown the specific directory being listed without recursion.
+        // This provides write permission for rename/delete.
+        dispatch_async(g_chown_queue, ^{
+             apfs_own([path UTF8String], 501, 501);
+        });
+        return;
+    }
+
     NSString *appRoot = app_root_for_path(path);
     if (!appRoot) return;
 
@@ -625,6 +630,9 @@ static void runExploit(void) {
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+    
+    int eret = sandbox_elevate_to_root(self_proc_addr);
+    NSLog(@"[Tweak] sandbox_elevate_to_root returned %d", eret);
 
     // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
     // flip on-disk ownership to mobile before opening. Example:
